@@ -1,0 +1,59 @@
+// package.grav — how apogee-permission connects itself to an app
+// (apogee-package): its settings, the access tables' migration, the gate
+// answering permissions, the role: and permission: middleware, and the
+// permission:create-role and permission:show commands.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-routing"
+import "apogee-console"
+import "apogee-auth"
+import "store.grav"
+import "access.grav"
+
+namespace apogee {
+
+    class PermissionPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "permission"; }
+        fn defaults() -> HashMap<string, any> {
+            return {"permission.cache_seconds": Env.getInt("PERMISSION_CACHE_SECONDS", 60),
+                    "permission.super_role": Env.get("PERMISSION_SUPER_ROLE", "")};
+        }
+        fn migrations() -> Array<any> { return [new CreateAccessTables() as any]; }
+        fn commands() -> Array<any> { return [new CreateRoleCommand() as any, new ShowAccessCommand() as any]; }
+        fn boot(app: PackageContext) {
+            Access.use(new OrbitAccessStore());
+            Access.cacheSeconds = Config.getInt("permission.cache_seconds", 60);
+            Access.superRole = Config.getString("permission.super_role", "");
+            Access.registerWith(app.make::<Gate>());
+            Access.middleware(app.make::<Router>());
+        }
+    }
+
+    // permission:create-role editor posts.edit posts.publish
+    class CreateRoleCommand extends ConsoleCommand {
+        constructor() {}
+        fn signature() -> string { return "permission:create-role {name : The role} {permissions?* : Permissions to grant it}"; }
+        fn description() -> string { return "Create a role (and grant it permissions)"; }
+        fn handle() -> int {
+            let role = Access.role(self.argument("name"));
+            let ps = new Array<string>();
+            for (p in Str.split(self.argument("permissions"), " ")) { if (Str.trim(p) != "") { ps.push(Str.trim(p)); } }
+            if (!ps.isEmpty()) { role.grant(ps); }
+            self.output.writeln("<info>Role ${role.name}: ${Str.join(role.permissions(), ", ")}</>");
+            return 0;
+        }
+    }
+
+    // permission:show — every role and what it grants.
+    class ShowAccessCommand extends ConsoleCommand {
+        constructor() {}
+        fn signature() -> string { return "permission:show"; }
+        fn description() -> string { return "List the roles and their permissions"; }
+        fn handle() -> int {
+            for (r in Access.roles()) { self.output.writeln(r + ": " + Str.join(Access.role(r).permissions(), ", ")); }
+            return 0;
+        }
+    }
+}

@@ -1,0 +1,55 @@
+// PermissionPackage connects itself: found, its defaults applied, its
+// migration and commands offered, and on boot the gate answers permissions
+// and the role: middleware works.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-auth"
+import "apogee-testing"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use orbit.*
+
+class Member implements Authenticatable {
+    public id: long
+    constructor(id: long) { self.id = id }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+
+test "the package connects itself" {
+    let ps = Packages.discover()
+    assertEq(ps.size(), 1)
+    let p = ps[0]
+    assertEq(p.name(), "permission")
+    Config.set("permission.super_role", "root")
+    Packages.applyDefaults(ps)
+    assertEq(Config.getInt("permission.cache_seconds", 0), 60 as long)
+    assertEq(p.commands().size(), 2)
+    let file = Dir.temp() + "/permission_pkg_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    (p.migrations()[0] as Migration).up()
+    let c = new Container()
+    let gate = new Gate()
+    c.instance::<Gate>(gate)
+    let r = new Router(c)
+    c.instance::<Router>(r)
+    p.register(new PackageContext(c, "testing", "k"))
+    p.boot(new PackageContext(c, "testing", "k"))
+    let ada = new Member(1)
+    Access.role("editor").grant(["posts.publish"])
+    Access.assignRole(ada, "editor")
+    assert(gate.allows(ada, "posts.publish"))
+    let root = new Member(2)
+    Access.assignRole(root, "root")
+    assert(Access.can(root, "anything at all"))                   // the configured super role
+    r.get("/admin", fn(req: Request) -> Response { return Response.json({"ok": true}) }).middleware(["role:editor"])
+    Request.userResolver = fn(req: Request) -> any { return req.header("X-User") == "ada" ? ada as any : null }
+    new TestClient(new HttpKernel(r)).withHeader("X-User", "ada").getJson("/admin").assertOk()
+    new File(file).delete()
+}

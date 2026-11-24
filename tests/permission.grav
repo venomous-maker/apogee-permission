@@ -8,9 +8,11 @@ import "apogee-routing"
 import "apogee-auth"
 import "apogee-testing"
 import "grav-db"
+import "grav-orbit"
 import "../src/all.grav"
 use apogee.*
 use db.*
+use orbit.*
 
 class Member implements Authenticatable {
     public id: long
@@ -56,13 +58,12 @@ fn exercise(store: AccessStore) {
 
 test "the memory store" { exercise(new MemoryAccessStore()) }
 
-test "the database store (SQLite), and the cache" {
+test "the Orbit store (SQLite), and the cache" {
     let file = Dir.temp() + "/permission_test_" + str(Process.pid()) + ".sqlite"
     new File(file).delete()
-    let store = new DatabaseAccessStore(new Pool(2, fn() -> Connection { return Sqlite.open(file) }))
-    store.createTables()
-    store.createTables()
-    exercise(store)
+    DB.connect(Sqlite.open(file))
+    new CreateAccessTables().up()
+    exercise(new OrbitAccessStore())
     // checks after the first come from the cache: no queries
     let u = new Member(9)
     Access.role("viewer").grant(["reports.view"])
@@ -104,16 +105,12 @@ test "the gate and the middleware" {
 }
 
 // With PERMISSION_MYSQL_URL / PERMISSION_POSTGRES_URL set (mysql://… / postgres://…).
-test "the database store on MySQL and PostgreSQL" {
+test "the Orbit store on MySQL and PostgreSQL" {
     for (url in [env("PERMISSION_MYSQL_URL"), env("PERMISSION_POSTGRES_URL")]) {
         if (url == "") { continue }
-        let open = fn() -> Connection { return Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection }
-        let pool = new Pool(2, open)
-        let c = pool.acquire()
-        for (t in ["roles", "permissions", "role_permissions", "model_roles", "model_permissions"]) { c.exec("DROP TABLE IF EXISTS access_" + t) }
-        pool.release(c)
-        let store = new DatabaseAccessStore(pool)
-        store.createTables()
-        exercise(store)
+        DB.connect(Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection)
+        new CreateAccessTables().down()
+        new CreateAccessTables().up()
+        exercise(new OrbitAccessStore())
     }
 }

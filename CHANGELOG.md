@@ -8,4 +8,8 @@ compiler versions it builds with.
 
 - `Access`: roles and permissions for any user, wildcards, a super role, a
   cache that changes drop; the gate hook and the role: and permission: middleware.
-- Memory and database (SQLite, MySQL, PostgreSQL) stores.
+- The access tables as Orbit models with their migration; an Orbit store
+  (SQLite, MySQL, PostgreSQL) and a memory one.
+- `PermissionPackage`: connects itself to an apogee-framework app (settings,
+  the gate, the middleware, the migration, `permission:create-role`,
+  `permission:show`).

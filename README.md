@@ -3,12 +3,16 @@
 Roles and permissions for [Apogee](https://github.com/venomous-maker) apps,
 stored in the database and cached, wired into the gate and the router.
 
+In an apogee-framework app, importing the module is all it takes:
+`PermissionPackage` adds the access tables' migration (run it with `migrate`),
+lets the gate answer permissions, registers the `role:` and `permission:`
+middleware, and adds `permission:create-role` and `permission:show`.
+
 ```grav
 import "std"
 import "apogee-permission"
 use apogee.*
 
-Access.use(new DatabaseAccessStore(pool))           // then .createTables(); memory by default
 Access.role("editor").grant(["posts.edit", "posts.publish"])
 Access.role("moderator").grant(["comments.*"])       // everything under comments.
 Access.assignRole(user, "editor")
@@ -18,8 +22,7 @@ Access.can(user, "posts.publish")                    // true
 Access.hasRole(user, "editor")                       // true
 Access.permissionsOf(user)                           // ["posts.edit", "posts.publish", "reports.view"]
 
-Access.registerWith(gate)                            // gate.allows(user, "posts.publish"), and can: middleware
-Access.middleware(router)                            // role: and permission:
+gate.allows(user, "posts.publish")                   // and can: middleware
 router.get("/admin", admin).middleware(["auth", "role:admin|editor"])
 router.post("/posts/{post}/publish", publish).middleware(["auth", "permission:posts.publish"])
 ```
@@ -37,16 +40,25 @@ router.post("/posts/{post}/publish", publish).middleware(["auth", "permission:po
 - **Middleware:** `role:a|b` and `permission:a|b` pass with any one of those
   listed; 401 without a user, 403 without the access.
 
+## Settings
+
+`permission.cache_seconds` (`PERMISSION_CACHE_SECONDS`, 60) and
+`permission.super_role` (`PERMISSION_SUPER_ROLE`, none).
+
 ## Stores
 
-`MemoryAccessStore` (one process) and `DatabaseAccessStore(pool, prefix = "access_")`:
-five tables (`roles`, `permissions`, `role_permissions`, `model_roles`,
-`model_permissions`) on SQLite, MySQL/MariaDB or PostgreSQL.
+`OrbitAccessStore` keeps everything in the app's database as Orbit models
+(`access_roles`, `access_permissions`, `access_role_permissions`,
+`access_model_roles`, `access_model_permissions`, made by `CreateAccessTables`)
+on SQLite, MySQL/MariaDB or PostgreSQL. `MemoryAccessStore` is for tests.
+Outside the framework: `Access.use(store)`, `Access.registerWith(gate)`,
+`Access.middleware(router)`.
 
 ## Tests
 
 ```sh
 grav test tests/permission.grav
+grav test tests/package.grav
 PERMISSION_MYSQL_URL=mysql://root:pw@127.0.0.1:3306/db PERMISSION_POSTGRES_URL=postgres://postgres:pw@127.0.0.1:5432/db grav test tests/permission.grav
 ```
 

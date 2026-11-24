@@ -1,0 +1,13 @@
+name = "apogee-permission"
+lib = "src/all.grav"
+grav = ">=1.11.0"
+paths = ["src"]
+
+[dependencies]
+apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
+apogee-http = "github.com/venomous-maker/apogee-http@v0.2.0"
+apogee-routing = "github.com/venomous-maker/apogee-routing@v0.2.0"
+apogee-auth = "github.com/venomous-maker/apogee-auth@v0.2.1"
+grav-db = "github.com/venomous-maker/grav-db@v0.2.0"
+# (the tests use the router and the testing client)
+apogee-testing = "github.com/venomous-maker/apogee-testing@v0.1.0"

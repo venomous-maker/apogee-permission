@@ -1,0 +1,119 @@
+// apogee-permission's tests: roles and permissions in the memory store and in
+// SQLite, wildcards and the super role, the cache (and changes dropping it),
+// the gate answering permissions, and the role: and permission: middleware.
+import "std"
+import "apogee-container"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-auth"
+import "apogee-testing"
+import "grav-db"
+import "../src/all.grav"
+use apogee.*
+use db.*
+
+class Member implements Authenticatable {
+    public id: long
+    constructor(id: long) { self.id = id }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+
+fn exercise(store: AccessStore) {
+    Access.use(store)
+    let ada = new Member(1)
+    let bob = new Member(2)
+    Access.role("editor").grant(["posts.edit", "posts.publish"])
+    Access.role("moderator").grant(["comments.*"])
+    Access.assignRole(ada, "editor")
+    Access.givePermission(bob, "posts.edit")
+    assert(Access.can(ada, "posts.publish") && Access.hasRole(ada, "editor"))
+    assert(Access.can(bob, "posts.edit") && !Access.can(bob, "posts.publish") && !Access.hasRole(bob, "editor"))
+    assertEq(Str.join(Access.permissionsOf(ada), ","), "posts.edit,posts.publish")
+    // wildcards
+    Access.assignRole(bob, "moderator")
+    assert(Access.can(bob, "comments.delete") && Access.can(bob, "comments.approve") && !Access.can(bob, "commentsx"))
+    // a change shows at once (the cache is dropped)
+    Access.role("editor").revoke(["posts.publish"])
+    assert(!Access.can(ada, "posts.publish"))
+    Access.syncRoles(ada, ["moderator"])
+    assertEq(Str.join(Access.rolesOf(ada), ","), "moderator")
+    assert(!Access.can(ada, "posts.edit") && Access.can(ada, "comments.flag"))
+    assertEq(Str.join(Access.usersWithRole("moderator"), ","), "Member#1,Member#2")
+    // the super role
+    Access.superRole = "admin"
+    let cy = new Member(3)
+    assert(!Access.can(cy, "anything"))
+    Access.assignRole(cy, "admin")
+    assert(Access.can(cy, "anything"))
+    Access.superRole = ""
+    Access.deleteRole("moderator")
+    assert(!Access.can(bob, "comments.delete") && Access.can(bob, "posts.edit"))
+    Access.revokePermission(bob, "posts.edit")
+    assert(!Access.can(bob, "posts.edit"))
+    assertEq(Str.join(Access.roles(), ","), "admin,editor")
+}
+
+test "the memory store" { exercise(new MemoryAccessStore()) }
+
+test "the database store (SQLite), and the cache" {
+    let file = Dir.temp() + "/permission_test_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    let store = new DatabaseAccessStore(new Pool(2, fn() -> Connection { return Sqlite.open(file) }))
+    store.createTables()
+    store.createTables()
+    exercise(store)
+    // checks after the first come from the cache: no queries
+    let u = new Member(9)
+    Access.role("viewer").grant(["reports.view"])
+    Access.assignRole(u, "viewer")
+    Access.can(u, "reports.view")
+    let t0 = Time.monotonicNs()
+    let n = 20000
+    for (i in 0..n) { assert(Access.can(u, "reports.view")) }
+    let ns = (Time.monotonicNs() - t0) / n
+    assert(ns < 5000)                                    // (well under a query's cost)
+    new File(file).delete()
+}
+
+test "the gate and the middleware" {
+    Access.use(new MemoryAccessStore())
+    let gate = new Gate()
+    Access.registerWith(gate)
+    gate.define("posts.delete", fn(user: any, args: Array<any>) -> any { return false })
+    let ada = new Member(1)
+    Access.role("editor").grant(["posts.publish", "posts.delete"])
+    Access.assignRole(ada, "editor")
+    assert(gate.allows(ada, "posts.publish"))            // a permission, no ability needed
+    assert(gate.allows(ada, "posts.delete"))             // the permission answers before the ability
+    assert(!gate.allows(new Member(2), "posts.publish"))
+    let r = new Router(new Container())
+    Access.middleware(r)
+    let who = new HashMap<string, Member>()
+    who.put("ada", ada)
+    who.put("bob", new Member(2))
+    r.get("/admin", fn(req: Request) -> Response { return Response.json({"ok": true}) }).middleware(["role:admin|editor"])
+    r.get("/publish", fn(req: Request) -> Response { return Response.json({"ok": true}) }).middleware(["permission:posts.publish"])
+    Request.userResolver = fn(req: Request) -> any { let n = req.header("X-User"); return who.containsKey(n) ? who.get(n) as any : null }
+    let c = new TestClient(new HttpKernel(r))
+    c.getJson("/admin").assertStatus(401)
+    c.withHeader("X-User", "bob").getJson("/admin").assertForbidden()
+    c.withHeader("X-User", "ada").getJson("/admin").assertOk()
+    c.withHeader("X-User", "ada").getJson("/publish").assertOk()
+    c.withHeader("X-User", "bob").getJson("/publish").assertForbidden()
+}
+
+// With PERMISSION_MYSQL_URL / PERMISSION_POSTGRES_URL set (mysql://… / postgres://…).
+test "the database store on MySQL and PostgreSQL" {
+    for (url in [env("PERMISSION_MYSQL_URL"), env("PERMISSION_POSTGRES_URL")]) {
+        if (url == "") { continue }
+        let open = fn() -> Connection { return Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection }
+        let pool = new Pool(2, open)
+        let c = pool.acquire()
+        for (t in ["roles", "permissions", "role_permissions", "model_roles", "model_permissions"]) { c.exec("DROP TABLE IF EXISTS access_" + t) }
+        pool.release(c)
+        let store = new DatabaseAccessStore(pool)
+        store.createTables()
+        exercise(store)
+    }
+}

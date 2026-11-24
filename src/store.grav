@@ -1,0 +1,156 @@
+// store.grav — where roles and permissions are kept: by name, with users
+// (any model) identified by a key such as "app.User#42".
+import "std"
+import "grav-db"
+use db.*
+
+namespace apogee {
+
+    interface AccessStore {
+        fn createRole(name: string)
+        fn createPermission(name: string)
+        fn deleteRole(name: string)
+        fn deletePermission(name: string)
+        fn roles() -> Array<string>
+        fn permissions() -> Array<string>
+        fn grant(role: string, permission: string)
+        fn revoke(role: string, permission: string)
+        fn permissionsOfRole(role: string) -> Array<string>
+        fn assign(model: string, role: string)
+        fn unassign(model: string, role: string)
+        fn rolesOf(model: string) -> Array<string>
+        fn give(model: string, permission: string)
+        fn take(model: string, permission: string)
+        fn directPermissionsOf(model: string) -> Array<string>
+        // The models that have `role`.
+        fn modelsWithRole(role: string) -> Array<string>
+    }
+
+    // In this process's memory (development, tests). Thread-safe.
+    class MemoryAccessStore implements AccessStore {
+        private roleSet: HashSet<string> = new HashSet<string>()
+        private permSet: HashSet<string> = new HashSet<string>()
+        private rolePerms: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
+        private modelRoles: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
+        private modelPerms: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
+        private lock: Mutex = new Mutex()
+        constructor() {}
+        private static fn add(m: HashMap<string, HashSet<string>>, k: string, v: string) {
+            let s = m.getOr(k, null);
+            if (s == null) { s = new HashSet<string>(); m.put(k, s); }
+            s.add(v);
+        }
+        private static fn list(m: HashMap<string, HashSet<string>>, k: string) -> Array<string> {
+            let s = m.getOr(k, null);
+            let out = new Array<string>();
+            if (s != null) { for (x in s) { out.push(x); } }
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn createRole(name: string) { self.lock.lock(); self.roleSet.add(name); self.lock.unlock(); }
+        fn createPermission(name: string) { self.lock.lock(); self.permSet.add(name); self.lock.unlock(); }
+        fn deleteRole(name: string) {
+            self.lock.lock();
+            self.roleSet.remove(name);
+            self.rolePerms.remove(name);
+            for (k in self.modelRoles.keys()) { self.modelRoles.get(k).remove(name); }
+            self.lock.unlock();
+        }
+        fn deletePermission(name: string) {
+            self.lock.lock();
+            self.permSet.remove(name);
+            for (k in self.rolePerms.keys()) { self.rolePerms.get(k).remove(name); }
+            for (k in self.modelPerms.keys()) { self.modelPerms.get(k).remove(name); }
+            self.lock.unlock();
+        }
+        fn roles() -> Array<string> { self.lock.lock(); let out = new Array<string>(); for (r in self.roleSet) { out.push(r); } self.lock.unlock(); out.sortBy(fn(a, b) => Str.compare(a, b)); return out; }
+        fn permissions() -> Array<string> { self.lock.lock(); let out = new Array<string>(); for (p in self.permSet) { out.push(p); } self.lock.unlock(); out.sortBy(fn(a, b) => Str.compare(a, b)); return out; }
+        fn grant(role: string, permission: string) { self.lock.lock(); MemoryAccessStore.add(self.rolePerms, role, permission); self.lock.unlock(); }
+        fn revoke(role: string, permission: string) { self.lock.lock(); let s = self.rolePerms.getOr(role, null); if (s != null) { s.remove(permission); } self.lock.unlock(); }
+        fn permissionsOfRole(role: string) -> Array<string> { self.lock.lock(); let out = MemoryAccessStore.list(self.rolePerms, role); self.lock.unlock(); return out; }
+        fn assign(model: string, role: string) { self.lock.lock(); MemoryAccessStore.add(self.modelRoles, model, role); self.lock.unlock(); }
+        fn unassign(model: string, role: string) { self.lock.lock(); let s = self.modelRoles.getOr(model, null); if (s != null) { s.remove(role); } self.lock.unlock(); }
+        fn rolesOf(model: string) -> Array<string> { self.lock.lock(); let out = MemoryAccessStore.list(self.modelRoles, model); self.lock.unlock(); return out; }
+        fn give(model: string, permission: string) { self.lock.lock(); MemoryAccessStore.add(self.modelPerms, model, permission); self.lock.unlock(); }
+        fn take(model: string, permission: string) { self.lock.lock(); let s = self.modelPerms.getOr(model, null); if (s != null) { s.remove(permission); } self.lock.unlock(); }
+        fn directPermissionsOf(model: string) -> Array<string> { self.lock.lock(); let out = MemoryAccessStore.list(self.modelPerms, model); self.lock.unlock(); return out; }
+        fn modelsWithRole(role: string) -> Array<string> {
+            let out = new Array<string>();
+            self.lock.lock();
+            for ((m, rs) in self.modelRoles) { if (rs.contains(role)) { out.push(m); } }
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+    }
+
+    // In five tables (prefix "access_"): roles, permissions, role_permissions,
+    // model_roles and model_permissions. SQLite, MySQL and PostgreSQL.
+    class DatabaseAccessStore implements AccessStore {
+        public prefix: string
+        private pool: Pool
+        constructor(pool: Pool, prefix: string = "access_") { self.pool = pool; self.prefix = prefix; }
+        private fn t(n: string) -> string { return self.prefix + n; }
+        private fn with(f: fn(Connection)) {
+            let c = self.pool.acquire();
+            try { f(c); } finally { self.pool.release(c); }
+        }
+        fn createTables() {
+            self.with(fn(c: Connection) {
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("roles") + " (name VARCHAR(125) NOT NULL PRIMARY KEY)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("permissions") + " (name VARCHAR(125) NOT NULL PRIMARY KEY)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("role_permissions") + " (role VARCHAR(125) NOT NULL, permission VARCHAR(125) NOT NULL, PRIMARY KEY (role, permission))");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("model_roles") + " (model VARCHAR(190) NOT NULL, role VARCHAR(125) NOT NULL, PRIMARY KEY (model, role))");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("model_permissions") + " (model VARCHAR(190) NOT NULL, permission VARCHAR(125) NOT NULL, PRIMARY KEY (model, permission))");
+                if (c.driver() != "mysql") { c.exec("CREATE INDEX IF NOT EXISTS " + self.t("model_roles") + "_role ON " + self.t("model_roles") + " (role)"); }
+            });
+        }
+        // Inserts a row unless it is there (one statement per driver).
+        private fn insert(table: string, cols: string, values: Array<any>) {
+            self.with(fn(c: Connection) {
+                let marks = values.size() == 1 ? "?" : "?, ?";
+                let sql = c.driver() == "mysql" ? "INSERT IGNORE INTO " + self.t(table) + " (" + cols + ") VALUES (" + marks + ")"
+                        : "INSERT INTO " + self.t(table) + " (" + cols + ") VALUES (" + marks + ") ON CONFLICT DO NOTHING";
+                c.execute(sql, values);
+            });
+        }
+        private fn names(sql: string, args: Array<any>) -> Array<string> {
+            let out = new Array<string>();
+            self.with(fn(c: Connection) { for (r in c.query(sql, args)) { out.push(r.getString("v")); } });
+            return out;
+        }
+        private fn run(sql: string, args: Array<any>) { self.with(fn(c: Connection) { c.execute(sql, args); }); }
+        fn createRole(name: string) { self.insert("roles", "name", [name as any]); }
+        fn createPermission(name: string) { self.insert("permissions", "name", [name as any]); }
+        fn deleteRole(name: string) {
+            self.with(fn(c: Connection) {
+                c.transaction(fn() {
+                    c.execute("DELETE FROM " + self.t("role_permissions") + " WHERE role = ?", [name]);
+                    c.execute("DELETE FROM " + self.t("model_roles") + " WHERE role = ?", [name]);
+                    c.execute("DELETE FROM " + self.t("roles") + " WHERE name = ?", [name]);
+                });
+            });
+        }
+        fn deletePermission(name: string) {
+            self.with(fn(c: Connection) {
+                c.transaction(fn() {
+                    c.execute("DELETE FROM " + self.t("role_permissions") + " WHERE permission = ?", [name]);
+                    c.execute("DELETE FROM " + self.t("model_permissions") + " WHERE permission = ?", [name]);
+                    c.execute("DELETE FROM " + self.t("permissions") + " WHERE name = ?", [name]);
+                });
+            });
+        }
+        fn roles() -> Array<string> { return self.names("SELECT name AS v FROM " + self.t("roles") + " ORDER BY name", new Array<any>()); }
+        fn permissions() -> Array<string> { return self.names("SELECT name AS v FROM " + self.t("permissions") + " ORDER BY name", new Array<any>()); }
+        fn grant(role: string, permission: string) { self.insert("role_permissions", "role, permission", [role as any, permission as any]); }
+        fn revoke(role: string, permission: string) { self.run("DELETE FROM " + self.t("role_permissions") + " WHERE role = ? AND permission = ?", [role as any, permission as any]); }
+        fn permissionsOfRole(role: string) -> Array<string> { return self.names("SELECT permission AS v FROM " + self.t("role_permissions") + " WHERE role = ? ORDER BY permission", [role as any]); }
+        fn assign(model: string, role: string) { self.insert("model_roles", "model, role", [model as any, role as any]); }
+        fn unassign(model: string, role: string) { self.run("DELETE FROM " + self.t("model_roles") + " WHERE model = ? AND role = ?", [model as any, role as any]); }
+        fn rolesOf(model: string) -> Array<string> { return self.names("SELECT role AS v FROM " + self.t("model_roles") + " WHERE model = ? ORDER BY role", [model as any]); }
+        fn give(model: string, permission: string) { self.insert("model_permissions", "model, permission", [model as any, permission as any]); }
+        fn take(model: string, permission: string) { self.run("DELETE FROM " + self.t("model_permissions") + " WHERE model = ? AND permission = ?", [model as any, permission as any]); }
+        fn directPermissionsOf(model: string) -> Array<string> { return self.names("SELECT permission AS v FROM " + self.t("model_permissions") + " WHERE model = ? ORDER BY permission", [model as any]); }
+        fn modelsWithRole(role: string) -> Array<string> { return self.names("SELECT model AS v FROM " + self.t("model_roles") + " WHERE role = ? ORDER BY model", [role as any]); }
+    }
+}

@@ -1,0 +1,201 @@
+// access.grav — roles and permissions for users (any model):
+//
+//   Access.use(new DatabaseAccessStore(pool))        // then .createTables(); memory by default
+//   Access.role("editor").grant(["posts.edit", "posts.publish"])
+//   Access.assignRole(user, "editor")
+//   Access.can(user, "posts.publish")                // true
+//   Access.hasRole(user, "editor")                   // true
+//   Access.registerWith(gate)                         // gate.allows(user, "posts.publish") too
+//   router.get("/admin", ...).middleware(["auth", "role:admin"])
+//
+// A permission ending in ".*" grants everything under it ("posts.*" grants
+// "posts.publish"); "*" grants everything. Each user's roles and permissions
+// are worked out once and kept for `cacheSeconds`; any change made here drops
+// what was kept, so a check costs a map lookup, not queries.
+import "std"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-auth"
+import "store.grav"
+
+namespace apogee {
+
+    // A user's roles and permissions, worked out (and when, for the cache).
+    class ResolvedAccess {
+        public roles: HashSet<string> = new HashSet<string>()
+        public permissions: HashSet<string> = new HashSet<string>()
+        public wildcards: Array<string> = new Array<string>()
+        public at: long
+        public generation: long
+        constructor(at: long, generation: long) { self.at = at; self.generation = generation; }
+        fn has(permission: string) -> bool {
+            if (self.permissions.contains(permission)) { return true; }
+            for (w in self.wildcards) {
+                if (w == "*" || Str.startsWith(permission, w)) { return true; }
+            }
+            return false;
+        }
+    }
+
+    // A role, to grant permissions to by name.
+    class RoleRef {
+        public name: string
+        constructor(name: string) { self.name = name; }
+        fn grant(permissions: Array<string>) -> RoleRef {
+            for (p in permissions) { Access.store.createPermission(p); Access.store.grant(self.name, p); }
+            Access.changed();
+            return self;
+        }
+        fn revoke(permissions: Array<string>) -> RoleRef {
+            for (p in permissions) { Access.store.revoke(self.name, p); }
+            Access.changed();
+            return self;
+        }
+        fn permissions() -> Array<string> { return Access.store.permissionsOfRole(self.name); }
+    }
+
+    class Access {
+        static store: AccessStore = new MemoryAccessStore()
+        // How long a user's worked-out access is kept (another process's changes show within it).
+        static cacheSeconds: long = 60
+        // A role that may do everything ("" for none).
+        static superRole: string = ""
+        private static cache: ConcurrentMap<string, ResolvedAccess> = new ConcurrentMap<string, ResolvedAccess>()
+        private static generation: AtomicLong = new AtomicLong(0)
+
+        static fn use(s: AccessStore) { Access.store = s; Access.changed(); }
+        // Drops every user's kept access (changes made here do it themselves).
+        static fn changed() { Access.generation.increment(); }
+
+        // ── roles and permissions ───────────────────────────────────────────
+        static fn role(name: string) -> RoleRef { Access.store.createRole(name); return new RoleRef(name); }
+        static fn permission(name: string) { Access.store.createPermission(name); }
+        static fn deleteRole(name: string) { Access.store.deleteRole(name); Access.changed(); }
+        static fn deletePermission(name: string) { Access.store.deletePermission(name); Access.changed(); }
+        static fn roles() -> Array<string> { return Access.store.roles(); }
+        static fn permissions() -> Array<string> { return Access.store.permissions(); }
+
+        // ── a user's ────────────────────────────────────────────────────────
+        // How a user is stored: its class and id ("app.User#42").
+        static fn key(user: any) -> string {
+            if (user == null) { throw new ValueError("no user"); }
+            if (user is string) { return user as string; }
+            let info = ClassInfo.of(user);
+            let name = info == null ? typename(user) : info.name;
+            if (user is Authenticatable) { return name + "#" + (user as Authenticatable).authId(); }
+            if (info != null) {
+                let f = info.field("id");
+                if (f != null && f.canGet()) { return name + "#" + str(f.get(user)); }
+            }
+            throw new ValueError("a user needs an id (Authenticatable, or an `id` field reflection can read): " + typename(user));
+        }
+        static fn assignRole(user: any, role: string) { Access.store.createRole(role); Access.store.assign(Access.key(user), role); Access.changed(); }
+        static fn removeRole(user: any, role: string) { Access.store.unassign(Access.key(user), role); Access.changed(); }
+        // Replaces the user's roles with these.
+        static fn syncRoles(user: any, roles: Array<string>) {
+            let k = Access.key(user);
+            for (r in Access.store.rolesOf(k)) { if (!roles.contains(r)) { Access.store.unassign(k, r); } }
+            for (r in roles) { Access.store.createRole(r); Access.store.assign(k, r); }
+            Access.changed();
+        }
+        static fn givePermission(user: any, permission: string) { Access.store.createPermission(permission); Access.store.give(Access.key(user), permission); Access.changed(); }
+        static fn revokePermission(user: any, permission: string) { Access.store.take(Access.key(user), permission); Access.changed(); }
+
+        static fn rolesOf(user: any) -> Array<string> {
+            let out = new Array<string>();
+            for (r in Access.resolve(user).roles) { out.push(r); }
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        // Every permission the user has, directly or through a role.
+        static fn permissionsOf(user: any) -> Array<string> {
+            let out = new Array<string>();
+            let r = Access.resolve(user);
+            for (p in r.permissions) { out.push(p); }
+            for (w in r.wildcards) { out.push(w == "*" ? "*" : w + "*"); }
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        static fn hasRole(user: any, role: string) -> bool { return user != null && Access.resolve(user).roles.contains(role); }
+        static fn hasAnyRole(user: any, roles: Array<string>) -> bool {
+            if (user == null) { return false; }
+            let r = Access.resolve(user);
+            for (x in roles) { if (r.roles.contains(x)) { return true; } }
+            return false;
+        }
+        static fn hasAllRoles(user: any, roles: Array<string>) -> bool {
+            if (user == null) { return false; }
+            let r = Access.resolve(user);
+            for (x in roles) { if (!r.roles.contains(x)) { return false; } }
+            return true;
+        }
+        // Whether the user has the permission (directly, through a role or a
+        // wildcard, or by having the super role).
+        static fn can(user: any, permission: string) -> bool {
+            if (user == null) { return false; }
+            let r = Access.resolve(user);
+            return (Access.superRole != "" && r.roles.contains(Access.superRole)) || r.has(permission);
+        }
+        static fn canAny(user: any, permissions: Array<string>) -> bool { for (p in permissions) { if (Access.can(user, p)) { return true; } } return false; }
+        static fn canAll(user: any, permissions: Array<string>) -> bool { for (p in permissions) { if (!Access.can(user, p)) { return false; } } return true; }
+        // The users (their keys) with a role.
+        static fn usersWithRole(role: string) -> Array<string> { return Access.store.modelsWithRole(role); }
+
+        // The user's access, from the cache while it is fresh and nothing has changed here.
+        static fn resolve(user: any) -> ResolvedAccess {
+            let k = Access.key(user);
+            let gen = Access.generation.get();
+            let now = Time.monotonicMs();
+            let have = Access.cache.getOr(k, null);
+            if (have != null && have.generation == gen && now - have.at < Access.cacheSeconds * 1000) { return have; }
+            let r = new ResolvedAccess(now, gen);
+            for (role in Access.store.rolesOf(k)) {
+                r.roles.add(role);
+                for (p in Access.store.permissionsOfRole(role)) { Access.addPermission(r, p); }
+            }
+            for (p in Access.store.directPermissionsOf(k)) { Access.addPermission(r, p); }
+            if (Access.cache.size() > 100000) { Access.cache.clear(); }          // (a bound)
+            Access.cache.put(k, r);
+            return r;
+        }
+        private static fn addPermission(r: ResolvedAccess, p: string) {
+            if (p == "*") { r.wildcards.push("*"); }
+            else if (Str.endsWith(p, ".*")) { r.wildcards.push(p[..p.length - 1]); }   // "posts.*" -> "posts."
+            else { r.permissions.add(p); }
+        }
+
+        // ── the gate and the router ─────────────────────────────────────────
+        // Lets the gate answer abilities that are permissions: a user who has
+        // the permission is allowed (policies still decide everything else).
+        static fn registerWith(gate: Gate) {
+            gate.before(fn(user: any, ability: string) -> bool? {
+                if (user != null && Access.can(user, ability)) { return true; }
+                return null;
+            });
+        }
+        // The `role:` and `permission:` middleware ("role:admin,editor": any of them).
+        static fn middleware(r: Router) {
+            r.aliasMiddleware("role", fn(a: Array<string>) -> Middleware { return new RequireAccess(a, true); });
+            r.aliasMiddleware("permission", fn(a: Array<string>) -> Middleware { return new RequireAccess(a, false); });
+        }
+    }
+
+    // `role:a,b` (any of the roles) or `permission:a,b` (any of the permissions):
+    // 401 without a user, 403 without the access.
+    class RequireAccess implements Middleware {
+        private names: Array<string>
+        private roles: bool
+        constructor(names: Array<string>, roles: bool) {
+            self.names = new Array<string>();
+            for (n in names) { for (part in Str.split(n, "|")) { if (Str.trim(part) != "") { self.names.push(Str.trim(part)); } } }
+            self.roles = roles;
+        }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            let user = req.user;
+            if (user == null) { throw new HttpException(401); }
+            let ok = self.roles ? Access.hasAnyRole(user, self.names) : Access.canAny(user, self.names);
+            if (!ok) { throw new HttpException(403, self.roles ? "You do not have the role for this." : "You do not have the permission for this."); }
+            return next(req);
+        }
+    }
+}

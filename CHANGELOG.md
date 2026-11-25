@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-25)
+
 - `Access`: roles and permissions for any user, wildcards, a super role, a
   cache that changes drop; the gate hook and the role: and permission: middleware.
 - The access tables as Orbit models with their migration; an Orbit store

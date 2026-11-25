@@ -18,11 +18,13 @@ namespace apogee {
         fn name() -> string { return "permission"; }
         fn defaults() -> HashMap<string, any> {
             return {"permission.cache_seconds": Env.getInt("PERMISSION_CACHE_SECONDS", 60),
-                    "permission.super_role": Env.get("PERMISSION_SUPER_ROLE", "")};
+                    "permission.super_role": Env.get("PERMISSION_SUPER_ROLE", ""),
+                    "permission.max_users": 100000};
         }
         fn migrations() -> Array<any> { return [new CreateAccessTables() as any]; }
         fn commands() -> Array<any> { return [new CreateRoleCommand() as any, new ShowAccessCommand() as any]; }
         fn boot(app: PackageContext) {
+            Access.maxUsers = Config.getInt("permission.max_users", 100000) as int;
             Access.use(new OrbitAccessStore());
             Access.cacheSeconds = Config.getInt("permission.cache_seconds", 60);
             Access.superRole = Config.getString("permission.super_role", "");

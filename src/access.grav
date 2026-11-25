@@ -60,10 +60,16 @@ namespace apogee {
         static cacheSeconds: long = 60
         // A role that may do everything ("" for none).
         static superRole: string = ""
-        private static cache: ConcurrentMap<string, ResolvedAccess> = new ConcurrentMap<string, ResolvedAccess>()
+        // At most this many users' access is kept (the least recently checked go first).
+        static maxUsers: int = 100000
+        private static cache: LruCache<string, ResolvedAccess> = new LruCache<string, ResolvedAccess>(100000)
         private static generation: AtomicLong = new AtomicLong(0)
 
-        static fn use(s: AccessStore) { Access.store = s; Access.changed(); }
+        static fn use(s: AccessStore) {
+            Access.store = s;
+            Access.cache = new LruCache<string, ResolvedAccess>(Access.maxUsers < 1 ? 1 : Access.maxUsers);
+            Access.changed();
+        }
         // Drops every user's kept access (changes made here do it themselves).
         static fn changed() { Access.generation.increment(); }
 
@@ -147,15 +153,14 @@ namespace apogee {
             let gen = Access.generation.get();
             let now = Time.monotonicMs();
             let have = Access.cache.getOr(k, null);
-            if (have != null && have.generation == gen && now - have.at < Access.cacheSeconds * 1000) { return have; }
+            if (have != null && have.generation == gen) { return have; }
             let r = new ResolvedAccess(now, gen);
             for (role in Access.store.rolesOf(k)) {
                 r.roles.add(role);
                 for (p in Access.store.permissionsOfRole(role)) { Access.addPermission(r, p); }
             }
             for (p in Access.store.directPermissionsOf(k)) { Access.addPermission(r, p); }
-            if (Access.cache.size() > 100000) { Access.cache.clear(); }          // (a bound)
-            Access.cache.put(k, r);
+            if (Access.cacheSeconds > 0) { Access.cache.putFor(k, r, Access.cacheSeconds * 1000); }
             return r;
         }
         private static fn addPermission(r: ResolvedAccess, p: string) {

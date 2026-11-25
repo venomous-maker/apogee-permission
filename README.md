@@ -42,8 +42,10 @@ router.post("/posts/{post}/publish", publish).middleware(["auth", "permission:po
 
 ## Settings
 
-`permission.cache_seconds` (`PERMISSION_CACHE_SECONDS`, 60) and
-`permission.super_role` (`PERMISSION_SUPER_ROLE`, none).
+`permission.cache_seconds` (`PERMISSION_CACHE_SECONDS`, 60),
+`permission.super_role` (`PERMISSION_SUPER_ROLE`, none) and
+`permission.max_users` (100000: the most users whose access is kept in memory,
+the least recently checked going first).
 
 ## Stores
 

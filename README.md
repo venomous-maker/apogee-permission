@@ -8,7 +8,7 @@ In an apogee-framework app, importing the module is all it takes:
 lets the gate answer permissions, registers the `role:` and `permission:`
 middleware, and adds `permission:create-role` and `permission:show`.
 
-```grav
+```typescript
 import "std"
 import "apogee-permission"
 use apogee.*

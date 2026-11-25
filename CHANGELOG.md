@@ -15,3 +15,7 @@ compiler versions it builds with.
 - `PermissionPackage`: connects itself to an apogee-framework app (settings,
   the gate, the middleware, the migration, `permission:create-role`,
   `permission:show`).
+
+### Dependencies
+
+- Uses apogee-http 0.3.0, apogee-routing 0.3.0, apogee-auth 0.2.2, apogee-console 0.2.2, apogee-package 0.1.0, grav-orbit 0.3.0, apogee-testing 0.1.1 (from their GitHub tags).
